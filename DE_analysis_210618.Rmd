@@ -2,7 +2,7 @@
 title: "R Notebook"
 output: html_notebook
 ---
-#this is the notebook to do differentially expressed gene analysis using salmon output (trimmed fastq file, no removing ribosome RNA.)
+#this is the notebook to do differentially expressed gene analysis using salmon output
 ```{r}
 sessionInfo()
 ```
