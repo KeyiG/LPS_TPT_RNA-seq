@@ -1,0 +1,478 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+#this is the notebook to do differentially expressed gene analysis using salmon output (trimmed fastq file, no removing ribosome RNA.)
+```{r}
+sessionInfo()
+```
+
+```{r}
+#load esembl annotation
+library(biomaRt)
+mart_mice <- useMart("ENSEMBL_MART_ENSEMBL", dataset = "mmusculus_gene_ensembl")
+listAttributes(mart_mice)
+ensembl2name_mice <- getBM(attributes=c("ensembl_gene_id","external_gene_name", "gene_biotype"),mart=mart_mice)
+listAttributes(mart_mice)
+
+#import salmon counting output
+library(tximportData)
+dir_salmon <- "/Users/TOP1_Keying/salmon_quanti_TPT"
+list.files(dir_salmon)
+samples_TOP1 <- c("LPS_1_quant", "LPS_2_quant", "LPS_3_quant","Naive_1_quant", "Naive_2_quant", "Naive_3_quant","TPT_1_quant", "TPT_2_quant", "TPT_3_quant")
+salmon_TOP1 <- file.path(dir_salmon, samples_TOP1 , "quant.sf")
+names(salmon_TOP1) <- c("LPS_1", "LPS_2", "LPS_3","Naive_1", "Naive_2", "Naive_3","TPT_1", "TPT_2", "TPT_3")
+all(file.exists(salmon_TOP1))
+#prepare annotation file
+library(dplyr)
+library(tidyverse)
+header_gene_TOP1 <- read.delim("/Users/TOP1_Keying/salmon_quanti/LPS_1_quant/quant.sf") %>%
+  tidyr::separate(Name, c("ENSMUST", "ENSMUSG", "OTTMUSG", "OTTMUST", "name1","name2","length","type"), sep = "([|])", remove = F ) %>%
+  dplyr::select(Name, ENSMUST, ENSMUSG, type)
+header_gene_TOP1$ENSMUSG <- str_replace(header_gene_TOP1$ENSMUSG,
+                        pattern = ".[0-9]+$",
+                        replacement = "")
+library(tximport)
+salmon_TOP1  <- tximport(salmon_TOP1 , type = "salmon", tx2gene = header_gene_TOP1[,c(1,3)])
+names(salmon_TOP1)
+#write TPM table
+TOP1_TPM_210616 <- as.data.frame(salmon_TOP1$abundance) %>%
+  tibble::rownames_to_column(var="gene")
+write.table(TOP1_TPM_210616, "/Users/TOP1_Keying/DEanalysis/TPT_TPM_210616.txt", quote = F, row.names = F)
+
+
+#QC: check what transcripts the libraries aligned to. to see how much ribosome RNA is left in each library.
+salmon_TOP1_countbytype <- dplyr::inner_join(tibble::rownames_to_column(as.data.frame(salmon_TOP1$counts), var="ENSMUSG"), header_gene_TOP1, by=c("ENSMUSG"="ENSMUSG")) %>%
+  dplyr::group_by(type) %>%
+  dplyr::summarise(LPS_1=sum(LPS_1),LPS_2=sum(LPS_2), LPS_3=sum(LPS_3), Naive_1=sum(Naive_1), Naive_2=sum(Naive_2), Naive_3=sum(Naive_3), TPT_1=sum(TPT_1), TPT_2=sum(TPT_2), TPT_3=sum(TPT_3))
+
+TOP1_countbytype <- salmon_TOP1_countbytype[,c(1,2)] %>%
+  dplyr::rename(count=LPS_1) %>%
+  slice_max(count, n = 5)
+TOP1_countbytype$sample="LPS_1"
+for (i in (3:10)) {
+  a <- salmon_TOP1_countbytype [,c(1,i)] 
+  a$sample=(colnames(salmon_TOP1_countbytype))[i]
+  names(a)[2] <- "count"
+  a <- a %>%
+  slice_max(count, n = 5)
+  TOP1_countbytype <- rbind(TOP1_countbytype, a)
+}
+
+library(ggplot2)
+ggplot(TOP1_countbytype, aes(fill=type, y=count, x=sample)) +
+  geom_bar(position="fill", stat="identity")
+
+#very successful rRNA depletion (polA tail enrichment)
+
+```
+
+
+
+
+
+```{r}
+#EdgeR
+#import data and filter
+library(edgeR)
+salmon_TOP1_count <- salmon_TOP1$counts
+txi_TOP1_list =DGEList(counts=salmon_TOP1_count, genes=row.names(salmon_TOP1_count))
+keep_TOP1 <- filterByExpr(txi_TOP1_list) 
+txi_TOP1_list <- txi_TOP1_list[keep_TOP1, , keep.lib.sizes=FALSE]
+txi_TOP1_list
+#recompute lib size
+txi_TOP1_list$samples$lib.size <- colSums(txi_TOP1_list$counts)
+txi_TOP1_list <- calcNormFactors(txi_TOP1_list)
+txi_TOP1_list$samples
+colors_TOP1 <- c("#D83620","#D85E20","#D88A20", "#121212", "#5D5D5D", "#969696", "#2066D8",  "#20BFD8", "#20D8AE") 
+pdf("/Users/TOP1_Keying/DEanalysis/MDS_txi_salmon_edgeR_TOP1.pdf")
+par(pty="s")
+plotMDS(txi_TOP1_list, pch=19, cex=4, cex.axis=1.5, cex.lab=2, col=colors_TOP1)
+dev.off()
+labels = c("LPS_1", "LPS_2", "LPS_3","Naive_1", "Naive_2", "Naive_3","TPT_1", "TPT_2", "TPT_3")
+gr_ <- factor(c("LPS","LPS","LPS","Naive","Naive","Naive","TPT","TPT", "TPT"))
+data.frame(Sample=colnames(txi_TOP1_list), gr_)
+design_TOP1 = model.matrix(~0+gr_)
+rownames(design_TOP1)<-colnames(txi_TOP1_list)
+design_TOP1
+#estimate dispersion
+txi_TOP1_list_disp <-estimateDisp(txi_TOP1_list, design_TOP1, robust =TRUE)
+txi_TOP1_list_disp$common.dispersion
+plotBCV(txi_TOP1_list_disp)
+
+#Differential expression. Based on manual, on section 3.4.2, it will create a matrix, 2 columns for off-target effect, two column for experiemnt comparison. the order will be ctrl, id, td. so id vs ctrl would be 0,0,
+txi_TOP1_list_disp_fit <- glmFit(txi_TOP1_list_disp,design_TOP1)
+txi_TOP1_list_disp_LvsN  <- glmLRT(txi_TOP1_list_disp_fit,contrast=c(1,-1,0))
+txi_TOP1_list_disp_TvsN <- glmLRT(txi_TOP1_list_disp_fit,contrast=c(0,-1,1))
+txi_TOP1_list_disp_TvsL <- glmLRT(txi_TOP1_list_disp_fit,contrast=c(-1,0,1))
+
+#LPS vs Naive
+topTags(txi_TOP1_list_disp_LvsN)
+print(summary(decideTests(txi_TOP1_list_disp_LvsN)))
+plotMD(txi_TOP1_list_disp_LvsN)
+abline(h=c(-1,1),col="red")
+
+
+#TPT vs naive
+topTags(txi_TOP1_list_disp_TvsN)
+print(summary(decideTests(txi_TOP1_list_disp_TvsN)))
+plotMD(txi_TOP1_list_disp_TvsN)
+abline(h=c(-1,1),col="red")
+
+#TPT vs LPS
+topTags(txi_TOP1_list_disp_TvsL)
+print(summary(decideTests(txi_TOP1_list_disp_TvsL)))
+plotMD(txi_TOP1_list_disp_TvsL)
+abline(h=c(-1,1),col="red")
+
+
+#writing files.
+write.table(topTags(txi_TOP1_list_disp_LvsN,n = length(txi_TOP1_list_disp_fit$counts[,1])),file="/Users/TOP1_Keying/DEanalysis/txi_TOP1_list_disp_LvsN.txt",sep="\t", quote = F, row.names = F )
+write.table(topTags(txi_TOP1_list_disp_TvsN,n = length(txi_TOP1_list_disp_fit$counts[,1])),file="/Users/TOP1_Keying/DEanalysis/txi_TOP1_list_disp_TvsN.txt",sep="\t", quote = F , row.names = F)
+write.table(topTags(txi_TOP1_list_disp_TvsL,n = length(txi_TOP1_list_disp_fit$counts[,1])),file="/Users/TOP1_Keying/DEanalysis/txi_TOP1_list_disp_TvsL.txt",sep="\t", quote = F , row.names = F)
+```
+
+
+
+#extract the sig DE genes from EdgeR
+```{r}
+#DE transcripts analysis the EdgeR
+TOP1_LvsN_edgR <-topTags(txi_TOP1_list_disp_LvsN, n= Inf, p.value = 0.05)$table
+TOP1_TvsN_edgR <-topTags(txi_TOP1_list_disp_TvsN, n= Inf, p.value = 0.05)$table
+TOP1_TvsL_edgR <-topTags(txi_TOP1_list_disp_TvsL, n= Inf, p.value = 0.05)$table
+
+library(dplyr)
+
+TOP1_LvsN_edgR <- dplyr::left_join(TOP1_LvsN_edgR, ensembl2name_mice,  by=c("genes"="ensembl_gene_id")) 
+write.table(TOP1_LvsN_edgR, file="/Users/TOP1_Keying/DEanalysis/TOP1_LvsN_edgR.txt",sep="\t", quote = F, row.names = F )
+TOP1_TvsL_edgR <- dplyr::left_join(TOP1_TvsL_edgR, ensembl2name_mice,  by=c("genes"="ensembl_gene_id")) 
+write.table(TOP1_TvsL_edgR, file="/Users/TOP1_Keying/DEanalysis/TOP1_TvsL_edgR.txt",sep="\t", quote = F, row.names = F )
+
+```
+
+
+
+#volcano plot, homemade scripts (EdgeR data)
+```{r}
+#read files of EdgeR.
+txi_TOP1_list_disp_LvsN <- read.delim("/Users/TOP1_Keying/DEanalysis/txi_TOP1_list_disp_LvsN.txt") %>%
+  dplyr::left_join(ensembl2name_mice, by=c("genes"="ensembl_gene_id"))
+txi_TOP1_list_disp_TvsL <- read.delim("/Users/TOP1_Keying/DEanalysis/txi_TOP1_list_disp_TvsL.txt") %>%
+  dplyr::left_join(ensembl2name_mice, by=c("genes"="ensembl_gene_id"))
+
+library(ggplot2)
+library(dplyr)
+library(ggrepel)
+interstgene_LvsN <- c("P2ry12", "Cx3cr1", "Sall1", "Olfml3", "Tmem119", "Scos3", "Stat3", "Dab2", "Il1b", "Mmp14", "Tnf", "Il6", "Csf1", "Tnip1", "Rab5a", "Aif1", "Notch1", "Trem2", "CD86", "Icam1", "Il27", "Cebpd", "Il1a", "Vcam1", "Plk3", "Hdac2", "Siglech", "Sod1", "Ccl2", "Top3a", "Top1")
+#to manully make the plot beautiful, I reset logFDR>=30 to be plotted on 30. And I will manually change the number 30 to >=30.
+txi_TOP1_list_disp_LvsN <- txi_TOP1_list_disp_LvsN %>%
+  dplyr::mutate(FDR_r=ifelse(FDR<=10^(-30), 10^(-30), FDR))
+ggplot(txi_TOP1_list_disp_LvsN , aes(logFC,-log10(FDR_r),label=external_gene_name)) +
+  geom_point(color="grey", size=1) +
+  geom_point(data = txi_TOP1_list_disp_LvsN %>% filter(FDR<=0.05 & logFC>0), color="#F4A582", size=1.5) +
+  geom_point(data = txi_TOP1_list_disp_LvsN %>% filter(FDR<=0.05 & logFC>0) %>% filter(external_gene_name %in% interstgene_LvsN), color="#B2182B", size=3) +
+  geom_point(data = txi_TOP1_list_disp_LvsN %>% filter(FDR<=0.05 & logFC<0), color="#92C5DE", size=1.5) +
+  geom_point(data = txi_TOP1_list_disp_LvsN %>% filter(FDR<=0.05 & logFC<0) %>% filter(external_gene_name %in% interstgene_LvsN), color="#2166AC", size=3) +
+  geom_point(data = txi_TOP1_list_disp_LvsN %>% filter(FDR>0.05) %>% filter(external_gene_name %in% interstgene_LvsN), color="#757373", size=3) +
+  geom_text_repel(data = txi_TOP1_list_disp_LvsN %>%  filter(external_gene_name %in% interstgene_LvsN), size=5, fontface = "italic", max.overlaps = Inf) +
+  theme_bw() +
+  scale_x_continuous(expand = c(0, 0)) + 
+  scale_y_continuous(expand = c(0, 0)) +
+  theme(axis.text = element_text(size = 20), 
+        axis.title = element_text(size = 20),
+        plot.title = element_text(size = 20, face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(size = 15, face = "bold", hjust = 0.5)) +
+  xlab("log2(FoldChange)") +
+  ylab("-log10(adj.P)") +
+  labs(subtitle="LPS group vs Naive group")
+ggsave("/Users/TOP1_Keying/DEanalysis/homemade_envolcano_LvsN_limi30.pdf", height=15, width = 15, units="cm")
+
+interstgene_TvsL <- c("Plk3", "Cebpd", "Cebpb", "Zfp36", "Tnf", "Il1b", "Il6", "Mmp14", "Csf1", "Csf1r", "Csf3","Rab24", "Rab5if", "Pik3r5", "Vamp2", "Il17ra", "Tubb5", "Actb", "Cbx3", "Cntn1", "Clca3a1", "Tnfrsf19", "Rab10", "Rab5a", "Junb", "Jak3", "Ms4a4c")
+ggplot(txi_TOP1_list_disp_TvsL, aes(logFC,-log10(FDR),label=external_gene_name)) +
+  geom_point(color="grey", size=1) +
+  geom_point(data = txi_TOP1_list_disp_TvsL %>% filter(FDR<=0.05 & logFC>0), color="#F4A582", size=1.5) +
+  geom_point(data = txi_TOP1_list_disp_TvsL %>% filter(FDR<=0.05 & logFC>0) %>% filter(external_gene_name %in% interstgene_TvsL), color="#B2182B", size=3) +
+  geom_point(data = txi_TOP1_list_disp_TvsL %>% filter(FDR<=0.05 & logFC<0), color="#92C5DE", size=1.5) +
+  geom_point(data = txi_TOP1_list_disp_TvsL %>% filter(FDR<=0.05 & logFC<0) %>% filter(external_gene_name %in% interstgene_TvsL), color="#2166AC", size=3) +
+  geom_point(data = txi_TOP1_list_disp_TvsL %>% filter(FDR>0.05) %>% filter(external_gene_name %in% interstgene_TvsL), color="#757373", size=3) +
+  geom_line(aes(x=2), size =0.7, linetype = "dashed", color="black") +
+  geom_line(aes(x=-2), size =0.7, linetype = "dashed", color="black") +
+  geom_line(aes(y=-log10(0.05)), size =0.7, linetype = "dashed", color="black") +
+  geom_line(aes(y=-log10(0.01)), size =0.7, linetype = "dashed", color="black") +
+  geom_text_repel(data = txi_TOP1_list_disp_TvsL %>%  filter(external_gene_name %in% interstgene_TvsL), size=5, fontface = "italic") +
+  theme_bw() +
+  theme(axis.text = element_text(size = 20), 
+        axis.title = element_text(size = 20),
+        plot.title = element_text(size = 20, face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(size = 15, face = "bold", hjust = 0.5)) +
+  xlab("log2(FoldChange)") +
+  ylab("-log10(adj.P)") +
+  labs(subtitle="TPT group vs LPS group")
+ggsave("/Users/TOP1_Keying/DEanalysis/homemade_envolcano_TvsL.pdf", height=15, width = 15, units="cm")
+
+```
+
+
+
+#output the file of DE gene name as input for HOMER
+```{r}
+write.table(DE_txi_share_TvsL$genes,"/Users/TOP1_Keying/DEanalysis/DE_txi_share_TvsL_ensemgene.txt", row.names = F, col.names = F, quote = F)
+write.table(DE_txi_share_LvsN$genes,"/Users/TOP1_Keying/DEanalysis/DE_txi_share_LvsN_ensemgene.txt", row.names = F, col.names = F, quote = F)
+
+```
+
+
+#GSEA analysis of TvsL using EdgeR
+```{r}
+#GSEA for GO term
+GSEA_GO_mouse_edgeR = function(x) {
+  library(clusterProfiler)
+  library(DOSE)
+  library(org.Mm.eg.db)
+  library(enrichplot)
+  library(ggplot2)
+  library(dplyr)
+  a_list <- x$logFC
+  names(a_list) <- x$genes
+  a_list = sort(a_list, decreasing = TRUE)
+  a_gse <- gseGO(geneList = a_list,
+             OrgDb = org.Mm.eg.db,
+             ont ="ALL", 
+             keyType = "ENSEMBL", 
+             nPerm = 10000, 
+             minGSSize = 5, 
+             maxGSSize = 800, 
+             pvalueCutoff = 0.05)
+}
+
+#GSEA for KEGG
+GSEA_KEGG_mouse_edgeR = function (x) {
+  library(clusterProfiler)
+  library(DOSE)
+  library(org.Mm.eg.db)
+  library(enrichplot)
+  library(ggplot2)
+  library(dplyr)
+  a_ids <- bitr(x$genes, fromType = "ENSEMBL", toType = "ENTREZID", OrgDb=org.Mm.eg.db)
+  a_entrezid <- dplyr::inner_join(x, a_ids, by=c("genes"="ENSEMBL"))
+  a_kegglist <- a_entrezid$logFC
+  names(a_kegglist) <- a_entrezid$ENTREZID
+  a_kegglist=sort(a_kegglist, decreasing = TRUE)
+  a_kegglist_gse <- gseKEGG(geneList = a_kegglist,
+               organism     = "mmu",
+               nPerm        = 10000,
+               minGSSize    = 5,
+               maxGSSize    = 800,
+               pvalueCutoff = 0.05,
+               pAdjustMethod = "none",
+               keyType       = "ncbi-geneid")
+  a_kegglist_gse
+}
+
+#GSEA-GO&KEGG analysis of TvsL_edgeR:
+TvsL_edgeR_gse <- GSEA_GO_mouse_edgeR(txi_TOP1_list_disp_TvsL)
+dotplot(TvsL_edgeR_gse, showCategory=10, title = "GSEA-GO pathways analysis: TPT vs LPS", split=".sign") + facet_grid(.~factor(.sign, levels=c("suppressed", "activated"))) + scale_color_gradient(high = "#FCF2D3", low = "#E7BF4D")
+ggsave("/Users/TOP1_Keying/DEanalysis/TvsL_edgeR_gse_ca10.pdf",height=12, width=22, units = "cm")
+TvsL_edgeR_kegglist_gse <- GSEA_KEGG_mouse_edgeR(txi_TOP1_list_disp_TvsL)
+dotplot(TvsL_edgeR_kegglist_gse, showCategory = 10, title = "GSEA-KEGG pathways analysis: TPT vs LPS" , split=".sign") + facet_grid(.~factor(.sign, levels=c("suppressed", "activated"))) + scale_color_gradient(high = "#FCF2D3", low = "#E7BF4D")
+ggsave("/Users/TOP1_Keying/DEanalysis/TvsL_edgeR_kegg_gse_ca10.pdf",height=12, width=18, units = "cm")
+gseaplot2(TvsL_edgeR_kegglist_gse, c("mmu04668", "mmu04064", "mmu04010", "mmu04657", "mmu04620", "mmu04060"))
+ggsave("/Users/TOP1_Keying/DEanalysis/TvsL_edgeR_kegg_gseplot_multi.pdf")
+
+#GSEA-GO&KEGG analysis of LvsN_edgeR:
+LvsN_edgeR_gse <- GSEA_GO_mouse_edgeR(txi_TOP1_list_disp_LvsN)
+dotplot(LvsN_edgeR_gse, showCategory=20, split=".sign", title = "GSEA-GO pathways analysis: LPS vs Naive") + facet_grid(.~factor(.sign, levels=c("suppressed", "activated")))  + scale_color_gradient(high = "#FCF2D3", low = "#E7BF4D")
+ggsave("/Users/TOP1_Keying/DEanalysis/LvsN_edgeR_gse.pdf", height=23, width=27, units = "cm")
+txi_TOP1_LvsN_gsekegg <- GSEA_KEGG_mouse_edgeR(txi_TOP1_list_disp_LvsN)
+dotplot(txi_TOP1_LvsN_gsekegg, showCategory = 20, title = "GSEA-KEGG pathways analysis: LPS vs Naive" , split=".sign") + facet_grid(.~factor(.sign, levels=c("suppressed", "activated"))) + scale_color_gradient(high = "#FCF2D3", low = "#E7BF4D")
+ggsave("/Users/TOP1_Keying/DEanalysis/LvsN_edgeR_kegg_gse.pdf",height=23, width=22, units = "cm")
+gseaplot2(txi_TOP1_LvsN_gsekegg,c("mmu04668", "mmu04064", "mmu04010", "mmu04657", "mmu04620", "mmu04060"))
+ggsave("/Users/TOP1_Keying/DEanalysis/LvsN_edgeR_kegg_gseplot_multiple.pdf")
+
+```
+#extract the gene name from GSEA KEGG analysis and use TPM to make heatmap.
+```{r}
+plotTPM_fromGSEAana_mouse = function(x,y,i,j) {
+  library(dplyr)
+  library(tidyverse)
+  library(clusterProfiler)
+  library(DOSE)
+  library(org.Mm.eg.db)
+  library(pheatmap)
+  library(RColorBrewer)
+  a <- x@result %>%
+  dplyr::filter(Description==y) %>%
+  dplyr::select(core_enrichment) %>%
+  str_split("/")
+  a_ids <- bitr(as.vector(unlist(a)), fromType = "ENTREZID", toType = "ENSEMBL", OrgDb=org.Mm.eg.db)
+  b <- as.data.frame(salmon_TOP1$abundance) %>%
+    tibble::rownames_to_column(var="Genes") %>%
+    dplyr::filter(Genes %in% (a_ids$ENSEMBL)) %>%
+    dplyr::inner_join(ensembl2name_mice, by=c("Genes"="ensembl_gene_id")) %>%
+    dplyr::select(-c("Genes", "gene_biotype")) %>%
+    tibble::column_to_rownames(var="external_gene_name") %>%
+    dplyr::rename(TPT_2=TPT_3) %>%
+    dplyr::rename(TPT_3=TPT_4) %>%
+    as.matrix()
+  col_heatmap_2 <- colorRampPalette(c("#2166AC", "#4393C3","#92C5DE","#D1E5F0","#FFFFFF", "#FDDBC7", "#F4A582","#D6604D","#B2182B"))
+  pheatmap(log2(b), scale="row", cluster_cols=F, cluster_rows=F,cellwidth = i, cellheight = j, border_color = "black", col= ( col_heatmap_2(30)), fontface = "italic")
+}
+
+pdf("/Users/TOP1_Keying/DEanalysis/TvsL_kegg_gse_geneTPM_TNF_lg.pdf")
+TvsL_kegg_gse_geneTPM_TNF <- plotTPM_fromGSEAana_mouse(TvsL_edgeR_kegglist_gse, "TNF signaling pathway", 12, 10)
+dev.off()
+pdf("/Users/TOP1_Keying/DEanalysis/TvsL_kegg_gse_geneTPM_NFkB_lg.pdf")
+TvsL_kegg_gse_geneTPM_NFkB <- plotTPM_fromGSEAana_mouse(TvsL_edgeR_kegglist_gse, "NF-kappa B signaling pathway", 12, 10)
+dev.off()
+pdf("/Users/TOP1_Keying/DEanalysis/TvsL_kegg_gse_geneTPM_IL17_lg.pdf")
+TvsL_kegg_gse_geneTPM_IL17 <- plotTPM_fromGSEAana_mouse(TvsL_edgeR_kegglist_gse, "IL-17 signaling pathway", 12, 10)
+dev.off()
+pdf("/Users/TOP1_Keying/DEanalysis/TvsL_kegg_gse_geneTPM_MAPK_lg.pdf")
+TvsL_kegg_gse_geneTPM_MAPK <- plotTPM_fromGSEAana_mouse(TvsL_edgeR_kegglist_gse, "MAPK signaling pathway", 10, 8)
+dev.off()
+pdf("/Users/TOP1_Keying/DEanalysis/TvsL_kegg_gse_geneTPM_Toll_like_lg.pdf")
+TvsL_kegg_gse_geneTPM_Tolllike <- plotTPM_fromGSEAana_mouse(TvsL_edgeR_kegglist_gse, "Toll-like receptor signaling pathway", 12, 10)
+dev.off()
+
+library(clusterProfiler)
+library(DOSE)
+library(org.Mm.eg.db)
+TvsL_entrezid <- dplyr::inner_join(txi_TOP1_list_disp_TvsL, (bitr(txi_TOP1_list_disp_TvsL$genes, fromType = "ENSEMBL", toType = "ENTREZID", OrgDb=org.Mm.eg.db)), by=c("genes"="ENSEMBL"))
+genelist_TvsL <- TvsL_entrezid$logFC
+names(genelist_TvsL) <- TvsL_entrezid$ENTREZID
+cnetplot(setReadable(TvsL_edgeR_kegglist_gse, 'org.Mm.eg.db', 'ENTREZID'), showCategory = 5, foldChange=genelist_TvsL, cex_label_gene = "italic")
+ggsave("/Users/TOP1_Keying/DEanalysis/TvsL_edgeR_kegglist_gse_cnetplot_first5.pdf",  height = 15, width=15, units = "cm")
+
+```
+
+
+#bar plot of top 50 upregulated and top 50 downregulated genes. And edgeR result is used.
+```{r}
+library(dplyr)
+#TvsL:TOP1_TvsL_edgR
+TvsL_edgeR_upDE <- TOP1_TvsL_edgR %>%
+  dplyr::filter(logFC>0) %>%
+  dplyr::mutate(rank=rank(desc(abs(logFC)), ties.method = 'first')) %>%
+  dplyr::mutate(DE="UP") %>%
+  dplyr::select(genes, logFC, external_gene_name, rank, DE, gene_biotype, logCPM) %>%
+  dplyr::slice_min(rank, n=50)
+TvsL_edgeR_downDE <- TOP1_TvsL_edgR %>%
+  dplyr::filter(logFC<0) %>%
+  dplyr::mutate(rank=rank(desc(abs(logFC)), ties.method = 'first')) %>%
+  dplyr::mutate(DE="Down") %>%
+  dplyr::select(genes, logFC, external_gene_name, rank, DE, gene_biotype, logCPM) %>%
+  dplyr::slice_min(rank, n=50)
+TvsL_edgeR_top50 <- rbind(TvsL_edgeR_upDE, TvsL_edgeR_downDE)
+library(ggplot2)
+ggplot(TvsL_edgeR_top50, aes(x=rank, y=logFC, fill=DE)) +
+    geom_bar(stat="identity", width=0.6, color="black", size=0.8) +
+    theme_classic(base_size = 16) +
+    theme(axis.text.x=element_blank(),
+          axis.title.x=element_blank(),
+          axis.ticks.x=element_blank(),
+          axis.line.x=element_blank(),
+          legend.position = "none",
+          plot.title = element_text(hjust = 0.5)) +
+    geom_text(data=TvsL_edgeR_top50, aes(label=external_gene_name),  
+              color="black", size=5, angle = 90, hjust=(ifelse(TvsL_edgeR_top50$DE=="Down", 1, 0)), nudge_y=(ifelse(TvsL_edgeR_top50$DE=="Down", -0.1, 0.1)), fontface = "italic")+
+    geom_hline(yintercept = 0, size =0.7, color="black") +
+    scale_fill_manual(values=c('#1CA8FC','#FC4E1C')) +
+    ggtitle("Top 50 differentially expressed gene comparing TPT group with LPS group") +
+    labs(y="Log2(Fold Change)") +
+    ylim(c(-5,5)) +
+    scale_x_continuous(expand = c(0.01, 0)) 
+ggsave("/Users/TOP1_Keying/DEanalysis/TvsL_edgeR_TOP50_updown_bar.pdf", height = 18, width=25, units = "cm")
+
+```
+
+
+#looking for BART predicted TF if it is also DE genes.
+```{r}
+library(dplyr)
+BART_TvsL <- read.delim("/Users/TOP1_Keying/DEanalysis/TvsL_edgeR_1614964313801558___Geneset_bart_results.txt") %>%
+  dplyr::filter(irwin_hall_pvalue < 0.05)
+intersect(tolower(BART_TvsL$TF), tolower(TOP1_TvsL_edgR$external_gene_name)) #"ikzf1"   "hdac2"   "ets1"    "bhlhe41" "notch1"  "tcf3"    "bach2"   "zbtb2"
+BART_TvsL_DE <- BART_TvsL %>% 
+  dplyr::filter(TF %in% (toupper(c("Ikzf1", "Hdac2", "Ets1", "Bhlhe41", "Notch1",  "Tcf3", "Bach2",  "Zbtb2")))) %>%
+  dplyr::arrange(desc(re_rank))
+
+```
+
+
+```{r}
+library(VennDiagram)
+Venn_col_2 <- c("#B3E2CD", "#FDCDAC")
+venn.diagram(
+  x=list(tolower(BART_TvsL$TF), tolower(TOP1_TvsL_edgR$external_gene_name)),
+  category.names = c("", ""),
+  filename="/Users/TOP1_Keying/DEanalysis/BART_DE.png",
+  output=T,
+# Output features
+  imagetype="png" ,
+  height = 800 , 
+  width = 800 , 
+  resolution = 300,
+  compression = "lzw",
+# Circles
+  lwd = 1,
+  lty = 'blank',
+  fill = Venn_col_2,
+# Numbers
+  cex = 2,
+  fontface = "bold",
+  fontfamily = "sans",
+# Set names
+  cat.cex = 0.5,
+  cat.fontface = "bold",
+  cat.default.pos = "outer",
+  cat.pos = c(-30, 30),
+  cat.fontfamily = "sans",
+  cat.dist = c(0.055, 0.055)
+  )
+
+```
+
+#BART plot for the DE genes
+```{r}
+library(ggplot2)
+library(stringr)
+library(ggrepel)
+BART_TvsL_DE$TF <- str_to_title(BART_TvsL_DE$TF)
+ggplot(BART_TvsL_DE, aes(x=-log10(irwin_hall_pvalue) , y=factor(TF, level=TF))) +
+  geom_bar(aes(fill=re_rank), stat = "identity") +
+  scale_fill_gradient(high = "#FCF2D3", low = "#E7BF4D") +
+  theme_bw() +
+  theme(text=element_text(size = 25),
+        plot.title = element_text(hjust = 1),
+        strip.text.x = element_text(size = 25),
+        axis.text.y=element_text(face="italic"),
+        axis.text.x=element_text(size=20),
+        legend.title=element_text(size=18)) +
+  xlab("-log10(Irwin-Hall P-value)") +
+  ylab("") +
+  labs(fill='Relative Rank')
+ggsave("/Users/TOP1_Keying/DEanalysis/BART_DE_BARTbarplot.pdf")
+TOP1_TvsL_edgR
+BART_TvsL_DE_Pval <- BART_TvsL_DE %>%
+  dplyr::inner_join(TOP1_TvsL_edgR, by =c("TF"="external_gene_name"))
+ggplot(BART_TvsL_DE_Pval, aes(x=-log10(irwin_hall_pvalue), y=-log10(FDR), color=logFC), label=TF) +
+  geom_point(size=5) +
+  scale_color_gradient2(mid="white", low="#2166AC",  high="#B2182B", space = "Lab") +
+  geom_text_repel(aes(label=TF), color="black", fontface = "italic", size=6) +
+  theme_bw() +
+  theme(text=element_text(size = 20),
+        plot.title = element_text(hjust = 1),
+        strip.text.x = element_text(size = 20),
+        axis.text.x=element_text(size=20),
+        legend.title=element_text(size=18))
+ ggsave("/Users/TOP1_Keying/DEanalysis/BART_DE_2pvalueFC.pdf") 
+```
+
+
+
+
+
+
+
+
+
