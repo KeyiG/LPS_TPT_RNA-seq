@@ -100,7 +100,7 @@ txi_TOP1_list_disp <-estimateDisp(txi_TOP1_list, design_TOP1, robust =TRUE)
 txi_TOP1_list_disp$common.dispersion
 plotBCV(txi_TOP1_list_disp)
 
-#Differential expression. Based on manual, on section 3.4.2, it will create a matrix, 2 columns for off-target effect, two column for experiemnt comparison. the order will be ctrl, id, td. so id vs ctrl would be 0,0,
+#Differential expression. 
 txi_TOP1_list_disp_fit <- glmFit(txi_TOP1_list_disp,design_TOP1)
 txi_TOP1_list_disp_LvsN  <- glmLRT(txi_TOP1_list_disp_fit,contrast=c(1,-1,0))
 txi_TOP1_list_disp_TvsN <- glmLRT(txi_TOP1_list_disp_fit,contrast=c(0,-1,1))
